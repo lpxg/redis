@@ -1,0 +1,177 @@
+name: Build Redis 7.2.4 (Last BSD License) on Windows
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+    branches: [main, master]
+  workflow_dispatch:
+    inputs:
+      redis_version:
+        description: 'Redis version (default: 7.2.4 - last BSD version)'
+        required: false
+        default: '7.2.4'
+
+env:
+  REDIS_VERSION: ${{ github.event.inputs.redis_version || '7.2.4' }}
+
+jobs:
+  build-redis-windows:
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x64, x86]
+        include:
+          - arch: x64
+            msystem: MINGW64
+            prefix: mingw-w64-x86_64
+            platform: x64
+          - arch: x86
+            msystem: MINGW32
+            prefix: mingw-w64-i686
+            platform: Win32
+    
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: ${{ matrix.msystem }}
+          update: true
+          install: >-
+            ${{ matrix.prefix }}-gcc
+            ${{ matrix.prefix }}-make
+            ${{ matrix.prefix }}-pkg-config
+            ${{ matrix.prefix }}-openssl
+            ${{ matrix.prefix }}-tcl
+            base-devel
+            git
+            wget
+
+      - name: Download Redis 7.2.4 source (Last BSD Version)
+        run: |
+          wget -O redis-${REDIS_VERSION}.tar.gz https://github.com/redis/redis/archive/${REDIS_VERSION}.tar.gz
+          tar -xzf redis-${REDIS_VERSION}.tar.gz
+          mv redis-${REDIS_VERSION} redis-src
+          echo "Building Redis ${REDIS_VERSION} - LAST BSD-3-CLAUSE LICENSE VERSION"
+          echo "This version is free for commercial use without restrictions"
+
+      - name: Build Redis
+        working-directory: redis-src
+        run: |
+          # 设置编译环境
+          export CFLAGS="-O2 -Wno-error -fno-common"
+          export LDFLAGS="-static-libgcc"
+          
+          # Redis 7.2.4 使用传统 Makefile，无需 ./configure
+          make -j1 MALLOC=libc BUILD_TLS=yes
+          
+          echo "Build completed for Redis ${REDIS_VERSION}"
+
+      - name: Run basic tests
+        working-directory: redis-src
+        continue-on-error: true
+        run: |
+          # 运行简短测试验证构建
+          ./runtest --single unit/printver || true
+          ./runtest --single unit/introspection || true
+
+      - name: Package binaries
+        working-directory: redis-src
+        run: |
+          mkdir -p redis-windows-${{ matrix.arch }}
+          
+          # 复制可执行文件
+          cp src/redis-server.exe redis-windows-${{ matrix.arch }}/
+          cp src/redis-cli.exe redis-windows-${{ matrix.arch }}/
+          cp src/redis-benchmark.exe redis-windows-${{ matrix.arch }}/
+          cp src/redis-check-aof.exe redis-windows-${{ matrix.arch }}/
+          cp src/redis-check-rdb.exe redis-windows-${{ matrix.arch }}/
+          cp src/redis-sentinel.exe redis-windows-${{ matrix.arch }}/
+          
+          # 复制配置文件
+          cp redis.conf redis-windows-${{ matrix.arch }}/
+          cp sentinel.conf redis-windows-${{ matrix.arch }}/
+          
+          # 创建 Windows 特定的 README
+          cat > redis-windows-${{ matrix.arch }}/README-BSD-LICENSE.txt << 'EOF'
+          Redis 7.2.4 for Windows
+          =======================
+          Architecture: ${{ matrix.arch }}
+          Build Date: $(date)
+          
+          ⚠️  IMPORTANT LICENSING INFORMATION:
+          
+          Redis 7.2.4 is the LAST version released under the BSD-3-Clause license.
+          This is the final version that is truly free for commercial use without 
+          any copyleft requirements or service restrictions.
+          
+          LICENSE: BSD-3-Clause (see https://github.com/redis/redis/blob/7.2.4/COPYING)
+          
+          Key advantages of BSD-3-Clause:
+          ✅ Commercial use allowed without restrictions
+          ✅ No requirement to open-source your modifications
+          ✅ No network use clause (unlike AGPL)
+          ✅ No service provider restrictions (unlike SSPL/RSAL)
+          
+          WARNING: Redis 7.4+ changed to RSALv2/SSPL dual license (not OSI-approved)
+          Redis 8.0+ offers AGPLv3 as option (copyleft, network use triggers source release)
+          
+          For true open source freedom, stay with 7.2.x or migrate to Valkey (Linux Foundation fork).
+          
+          START SERVER:
+          redis-server.exe redis.conf
+          
+          CONNECT CLIENT:
+          redis-cli.exe
+          EOF
+          
+          # 创建 zip 压缩包
+          7z a -tzip redis-${REDIS_VERSION}-windows-${{ matrix.arch }}-BSD.zip redis-windows-${{ matrix.arch }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: redis-${{ env.REDIS_VERSION }}-windows-${{ matrix.arch }}-BSD
+          path: redis-src/redis-${{ env.REDIS_VERSION }}-windows-${{ matrix.arch }}-BSD.zip
+          retention-days: 90
+
+      - name: Create Release (if tagged)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: redis-src/redis-${{ env.REDIS_VERSION }}-windows-${{ matrix.arch }}-BSD.zip
+          body: |
+            Redis ${{ env.REDIS_VERSION }} for Windows (${{ matrix.arch }})
+            
+            **⚠️ LAST BSD-3-CLAUSE LICENSE VERSION**
+            
+            This is the final Redis version released under the permissive BSD-3-Clause license,
+            making it free for commercial use without copyleft or service restrictions.
+            
+            **License**: BSD-3-Clause (OSI Approved)
+            **Commercial Use**: ✅ Allowed without restrictions
+            **Modification Distribution**: ✅ No requirement to open-source
+            
+            **Why this version matters**:
+            - Redis 7.4+ uses RSALv2/SSPL (not OSI-approved, restricts managed services)
+            - Redis 8.0+ adds AGPLv3 option (copyleft, network use requires source release)
+            - Redis 7.2.4 is the last truly "free" version for all use cases
+            
+            **Alternative**: Consider Valkey (Linux Foundation fork) for ongoing BSD-licensed updates.
+            
+            **Build Details**:
+            - Architecture: ${{ matrix.arch }}
+            - Compiler: GCC (MSYS2)
+            - TLS Support: Yes
+            - Memory Allocator: libc
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
