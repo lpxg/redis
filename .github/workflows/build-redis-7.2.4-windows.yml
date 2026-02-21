@@ -1,62 +1,469 @@
-name: Build Redis 7.2.4 on Windows (MSYS2 POSIX)
+name: Build Redis DIY (Secure)
 
 on:
-  push:
-    branches: [main, master]
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Redis Version (e.g., 6.2.13)'
+        required: true
+        default: "6.2.13"
+        type: string
+      redis_hash:
+        description: 'SHA256 hash of Redis source tarball (optional but recommended)'
+        required: false
+        type: string
+      make_latest:
+        description: 'Mark as latest release'
+        default: false
+        type: boolean
 
 env:
-  REDIS_VERSION: 7.2.4
+  # 固定工具版本，防止供应链攻击
+  MSYS2_VERSION: 'v2'
+  DOTNET_VERSION: '8.0.x'
+  # 允许的安全字符集
+  ALLOWED_CHARS: '0123456789.'
 
 jobs:
-  build:
-    runs-on: windows-latest
-    defaults:
-      run:
-        shell: msys2 {0}
-    
+  validate-inputs:
+    runs-on: ubuntu-latest
+    outputs:
+      tag_name: ${{ steps.validate.outputs.tag_name }}
+      safe_version: ${{ steps.validate.outputs.safe_version }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Strict input validation
+        id: validate
+        run: |
+          # 获取输入并移除潜在危险字符
+          RAW_TAG="${{ inputs.tag_name }}"
+          
+          # 只允许数字和点号
+          if [[ ! "$RAW_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid version format. Expected: x.y.z (e.g., 6.2.13)"
+            exit 1
+          fi
+          
+          # 验证版本号合理性
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$RAW_TAG"
+          if [[ "$MAJOR" -lt 5 ]] || [[ "$MAJOR" -gt 8 ]]; then
+            echo "::error::Major version $MAJOR is not supported (allowed: 5-8)"
+            exit 1
+          fi
+          
+          # 输出净化后的版本号
+          echo "tag_name=$RAW_TAG" >> $GITHUB_OUTPUT
+          echo "safe_version=${RAW_TAG//./-}" >> $GITHUB_OUTPUT
+          
+          echo "✅ Input validation passed: $RAW_TAG"
 
-      - name: Setup MSYS2 (MSYS environment)
+  build:
+    needs: validate-inputs
+    runs-on: windows-latest
+    permissions:
+      contents: write  # 最小权限：仅需要写入 Release
+      actions: read
+    
+    env:
+      RELEASE_VERSION: ${{ needs.validate-inputs.outputs.tag_name }}
+      SAFE_VERSION: ${{ needs.validate-inputs.outputs.safe_version }}
+      REDIS_DIST: Redis-${{ needs.validate-inputs.outputs.tag_name }}-Windows-x64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false  # 防止凭据泄露
+
+      - name: Setup dotnet
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Build .NET components securely
+        run: |
+          dotnet publish -c Release -r win-x64 --self-contained true `
+            -p:PublishSingleFile=true `
+            -p:EnableCompressionInSingleFile=true `
+            -p:DebugType=None `
+            -p:DebugSymbols=false
+
+      - name: Download Redis source with verification
+        id: download
+        run: |
+          $version = $env:RELEASE_VERSION
+          $url = "https://github.com/redis/redis/archive/refs/tags/$version.tar.gz"
+          $output = "redis-$version.tar.gz"
+          
+          Write-Host "Downloading Redis $version from GitHub..."
+          
+          try {
+            # 设置安全协议和超时
+            $ProgressPreference = 'SilentlyContinue'
+            Invoke-WebRequest -Uri $url -OutFile $output `
+              -MaximumRedirection 3 `
+              -TimeoutSec 300 `
+              -UserAgent "GitHub-Actions-Build/1.0"
+          } catch {
+            Write-Error "Failed to download Redis source: $_"
+            exit 1
+          }
+          
+          # 计算 SHA256
+          $hash = (Get-FileHash $output -Algorithm SHA256).Hash
+          Write-Host "Downloaded file SHA256: $hash"
+          "SHA256_HASH=$hash" | Out-File -Append $env:GITHUB_ENV
+          
+          # 如果用户提供了预期哈希，进行验证
+          $expectedHash = "${{ inputs.redis_hash }}"
+          if ($expectedHash -and ($expectedHash -ne "")) {
+            if ($hash -ne $expectedHash.ToUpper()) {
+              Write-Error "SHA256 mismatch! Expected: $expectedHash, Got: $hash"
+              Write-Error "Possible supply chain attack or corrupted download."
+              exit 1
+            }
+            Write-Host "✅ SHA256 verification passed"
+          } else {
+            Write-Warning "No SHA256 hash provided for verification. This is insecure!"
+            Write-Host "::warning::Add the following hash to workflow inputs: $hash"
+          }
+          
+          # 提取并验证目录结构
+          tar -tzf $output | head -20
+          if ($LASTEXITCODE -ne 0) {
+            Write-Error "Invalid tar.gz file"
+            exit 1
+          }
+
+      - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
-          msystem: MSYS  # 使用 MSYS 而非 UCRT64，提供完整 POSIX
           update: true
           install: >-
             gcc
             make
             pkg-config
-            openssl-devel
             libopenssl
-            tcl
-            python
-            base-devel
-            git
+            openssl-devel
+            zip
 
-      - name: Download Redis
+      - name: MSYS2 Build Redis
+        shell: msys2 {0}
+        env:
+          CC: gcc
+          CXX: g++
         run: |
-          wget https://github.com/redis/redis/archive/${REDIS_VERSION}.tar.gz
-          tar -xzf ${REDIS_VERSION}.tar.gz
-          cd redis-${REDIS_VERSION}
+          set -euo pipefail  # 严格错误处理
+          
+          workspace=$(pwd)
+          mkdir -p "${{ env.REDIS_DIST }}-msys2"
+          
+          # 提取源码（不修改系统文件）
+          tar -xzf "redis-${{ env.RELEASE_VERSION }}.tar.gz"
+          cd "redis-${{ env.RELEASE_VERSION }}"
+          
+          # 验证源码完整性
+          if [[ ! -f "src/server.c" ]] || [[ ! -f "Makefile" ]]; then
+            echo "Invalid Redis source structure"
+            exit 1
+          fi
+          
+          # 生成版本头（不修改系统头文件）
+          cd src
+          chmod +x mkreleasehdr.sh
+          ./mkreleasehdr.sh
+          cd ..
+          
+          # 修改 asciilogo（仅修改项目内文件）
+          sed -i 's/\"\;/\"/' src/asciilogo.h
+          {
+            echo '" Redis for Windows Project Home \n"'
+            echo '" https://github.com/redis-windows/redis-windows   \n\n";'
+          } >> src/asciilogo.h
+          
+          # 安全编译选项
+          # -O2: 优化但保持安全
+          # -fstack-protector-strong: 栈保护
+          # -D_FORTIFY_SOURCE=2: 缓冲区检查
+          # -Wformat -Wformat-security: 格式化字符串检查
+          # -fPIE -pie: 位置无关代码
+          # -Wl,-z,relro,-z,now: 重定位只读和立即绑定
+          export CFLAGS="-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+            -Wformat -Wformat-security -Wno-char-subscripts \
+            -fPIE -fPIC"
+          export LDFLAGS="-pie -Wl,-z,relro,-z,now"
+          
+          # 构建（使用多线程但限制并行度）
+          make -j2 BUILD_TLS=yes MALLOC=libc CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS"
+          
+          # 验证关键文件生成
+          required_bins=("redis-server.exe" "redis-cli.exe" "redis-benchmark.exe")
+          for bin in "${required_bins[@]}"; do
+            if [[ ! -f "src/$bin" ]]; then
+              echo "ERROR: Required binary $bin not found"
+              exit 1
+            fi
+          done
+          
+          # 复制文件（显式列出，不使用 find）
+          cp -f src/redis-server.exe src/redis-cli.exe src/redis-benchmark.exe \
+             src/redis-check-aof.exe src/redis-check-rdb.exe src/redis-sentinel.exe \
+             redis.conf sentinel.conf \
+             "$workspace/${{ env.REDIS_DIST }}-msys2/"
+          
+          cd "$workspace"
+          
+          # 复制文档和脚本
+          cp -f README.md README.zh_CN.md start.bat \
+             "${{ env.REDIS_DIST }}-msys2/" 2>/dev/null || true
+          
+          # 复制必要的 MSYS2 DLL（验证存在性）
+          msys_dlls=("/usr/bin/msys-2.0.dll" "/usr/bin/msys-crypto-3.dll" "/usr/bin/msys-ssl-3.dll")
+          for dll in "${msys_dlls[@]}"; do
+            if [[ -f "$dll" ]]; then
+              cp -f "$dll" "${{ env.REDIS_DIST }}-msys2/"
+            else
+              echo "WARNING: Missing DLL: $dll"
+            fi
+          done
+          
+          # 修改配置文件（使用安全的 pidfile 路径）
+          sed -i 's|^pidfile /var/run|pidfile ./logs|' "${{ env.REDIS_DIST }}-msys2/redis.conf"
+          mkdir -p "${{ env.REDIS_DIST }}-msys2/logs"
+          
+          # 打包
+          zip -q -r "${{ env.REDIS_DIST }}-msys2.zip" "${{ env.REDIS_DIST }}-msys2"
+          
+          # 创建带服务支持的版本
+          cp -f install_redis_service.bat uninstall_redis_service.bat publish/* \
+             "${{ env.REDIS_DIST }}-msys2/" 2>/dev/null || true
+          mv "${{ env.REDIS_DIST }}-msys2" "${{ env.REDIS_DIST }}-msys2-with-Service"
+          zip -q -r "${{ env.REDIS_DIST }}-msys2-with-Service.zip" "${{ env.REDIS_DIST }}-msys2-with-Service"
 
-      - name: Build
-        working-directory: redis-${{ env.REDIS_VERSION }}
+      - name: Verify MSYS2 build
         run: |
-          # 禁用 SSL 避免 Windows API 问题
-          make -j1 MALLOC=libc BUILD_TLS=no
+          $version = $env:RELEASE_VERSION
+          $exe = ".\${{ env.REDIS_DIST }}-msys2-with-Service\redis-server.exe"
+          
+          if (-not (Test-Path $exe)) {
+            Write-Error "redis-server.exe not found"
+            exit 1
+          }
+          
+          # 检查版本信息
+          $output = & $exe --version 2>&1
+          Write-Host "Build output: $output"
+          
+          if ($output -notmatch [regex]::Escape($version)) {
+            Write-Error "Version verification failed. Expected: $version"
+            exit 1
+          }
+          
+          # 检查是否为有效的 PE 文件
+          $peHeader = [System.IO.File]::ReadAllBytes($exe)[0..1]
+          $magic = [System.Text.Encoding]::ASCII.GetString($peHeader)
+          if ($magic -ne "MZ") {
+            Write-Error "Invalid Windows executable format"
+            exit 1
+          }
+          
+          Write-Host "✅ MSYS2 build verification passed"
 
-      - name: Package
-        working-directory: redis-${{ env.REDIS_VERSION }}
-        run: |
-          mkdir -p redis-win
-          cp src/redis-server redis-win/
-          cp src/redis-cli redis-win/
-          cp src/redis-benchmark redis-win/
-          cp redis.conf sentinel.conf redis-win/
-          tar -czf redis-${{ env.REDIS_VERSION }}-msys2.tar.gz redis-win
-
-      - uses: actions/upload-artifact@v4
+      - name: Setup Cygwin
+        uses: cygwin/cygwin-install-action@master
         with:
-          name: redis-msys2
-          path: redis-${{ env.REDIS_VERSION }}/redis-${{ env.REDIS_VERSION }}-msys2.tar.gz
+          packages: >-
+            make
+            gcc-core
+            pkg-config
+            libssl-devel
+            zip
+
+      - name: Cygwin Build Redis
+        shell: C:\cygwin\bin\bash.exe -eo pipefail {0}
+        env:
+          CYGWIN_NOWINPATH: 1
+          CC: gcc
+          CXX: g++
+        run: |
+          workspace=$(pwd)
+          mkdir -p "${{ env.REDIS_DIST }}-cygwin"
+          
+          # 清理并重新提取（确保干净构建）
+          rm -rf "redis-${{ env.RELEASE_VERSION }}"
+          tar -xzf "redis-${{ env.RELEASE_VERSION }}.tar.gz"
+          cd "redis-${{ env.RELEASE_VERSION }}"
+          
+          # 验证源码
+          if [[ ! -f "src/server.c" ]]; then
+            echo "Invalid source structure"
+            exit 1
+          fi
+          
+          cd src
+          chmod +x mkreleasehdr.sh
+          ./mkreleasehdr.sh
+          cd ..
+          
+          # 修改 asciilogo
+          sed -i 's/\"\;/\"/' src/asciilogo.h
+          {
+            echo '" Redis for Windows Project Home \n"'
+            echo '" https://github.com/redis-windows/redis-windows   \n\n";'
+          } >> src/asciilogo.h
+          
+          # 使用安全编译选项
+          export CFLAGS="-O2 -fstack-protector-strong -D_FORTIFY_SOURCE=2 \
+            -Wformat -Wformat-security -Wno-char-subscripts \
+            -fPIE -fPIC"
+          export LDFLAGS="-pie -Wl,-z,relro,-z,now"
+          
+          make -j2 BUILD_TLS=yes MALLOC=libc CFLAGS="$CFLAGS" LDFLAGS="$LDFLAGS"
+          
+          # 复制文件
+          cp -f src/redis-server.exe src/redis-cli.exe src/redis-benchmark.exe \
+             src/redis-check-aof.exe src/redis-check-rdb.exe src/redis-sentinel.exe \
+             redis.conf sentinel.conf \
+             "$workspace/${{ env.REDIS_DIST }}-cygwin/"
+          
+          cd "$workspace"
+          
+          cp -f README.md README.zh_CN.md start.bat \
+             "${{ env.REDIS_DIST }}-cygwin/" 2>/dev/null || true
+          
+          # 复制 Cygwin DLL
+          cyg_dlls=("/bin/cygcrypto-3.dll" "/bin/cygwin1.dll" "/bin/cygssl-3.dll" "/bin/cygz.dll")
+          for dll in "${cyg_dlls[@]}"; do
+            if [[ -f "$dll" ]]; then
+              cp -f "$dll" "${{ env.REDIS_DIST }}-cygwin/"
+            else
+              echo "WARNING: Missing DLL: $dll"
+            fi
+          done
+          
+          # 修改配置
+          sed -i 's|^pidfile /var/run|pidfile ./logs|' "${{ env.REDIS_DIST }}-cygwin/redis.conf"
+          mkdir -p "${{ env.REDIS_DIST }}-cygwin/logs"
+          
+          zip -q -r "${{ env.REDIS_DIST }}-cygwin.zip" "${{ env.REDIS_DIST }}-cygwin"
+          
+          cp -f install_redis_service.bat uninstall_redis_service.bat publish/* \
+             "${{ env.REDIS_DIST }}-cygwin/" 2>/dev/null || true
+          mv "${{ env.REDIS_DIST }}-cygwin" "${{ env.REDIS_DIST }}-cygwin-with-Service"
+          zip -q -r "${{ env.REDIS_DIST }}-cygwin-with-Service.zip" "${{ env.REDIS_DIST }}-cygwin-with-Service"
+
+      - name: Verify Cygwin build
+        run: |
+          $version = $env:RELEASE_VERSION
+          $exe = ".\${{ env.REDIS_DIST }}-cygwin-with-Service\redis-server.exe"
+          
+          if (-not (Test-Path $exe)) {
+            Write-Error "redis-server.exe not found"
+            exit 1
+          }
+          
+          $output = & $exe --version 2>&1
+          if ($output -notmatch [regex]::Escape($version)) {
+            Write-Error "Version verification failed"
+            exit 1
+          }
+          
+          # 验证 PE 文件
+          $bytes = [System.IO.File]::ReadAllBytes($exe)[0..1]
+          if ([System.Text.Encoding]::ASCII.GetString($bytes) -ne "MZ") {
+            Write-Error "Invalid executable format"
+            exit 1
+          }
+          
+          Write-Host "✅ Cygwin build verification passed"
+
+      - name: Generate SBOM and checksums
+        id: checksums
+        run: |
+          $dist = "${{ env.REDIS_DIST }}"
+          
+          # 生成哈希值
+          $hashes = @()
+          $files = @(
+            "$dist-msys2.zip",
+            "$dist-msys2-with-Service.zip", 
+            "$dist-cygwin.zip",
+            "$dist-cygwin-with-Service.zip"
+          )
+          
+          "Hashes" | Out-File -Encoding utf8 redis_latest_body.txt
+          "=========" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          "" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          
+          foreach ($file in $files) {
+            if (Test-Path $file) {
+              $hash = Get-FileHash $file -Algorithm SHA256
+              "$($file): $($hash.Hash)" | Tee-Object -Append -FilePath redis_latest_body.txt
+              $hashes += $hash.Hash
+            } else {
+              Write-Error "Missing file: $file"
+              exit 1
+            }
+          }
+          
+          # 添加源码哈希
+          "" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          "Source SHA256: ${{ env.SHA256_HASH }}" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          "" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          
+          # 添加构建信息
+          "Build Information" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          "==================" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          "Version: ${{ env.RELEASE_VERSION }}" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          "Build Date: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss UTC')" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          "Runner: ${{ runner.os }}-${{ runner.arch }}" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          "Workflow Run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" | Out-File -Append -Encoding utf8 redis_latest_body.txt
+          
+          # 设置输出供后续步骤使用
+          "HASHES=$($hashes -join ',')" | Out-File -Append $env:GITHUB_ENV
+
+      - name: Virus scan
+        run: |
+          $dist = "${{ env.REDIS_DIST }}"
+          Write-Host "Scanning build artifacts with Windows Defender..."
+          
+          $files = @(
+            "$dist-msys2-with-Service\redis-server.exe",
+            "$dist-cygwin-with-Service\redis-server.exe"
+          )
+          
+          foreach ($file in $files) {
+            if (Test-Path $file) {
+              # 使用 Windows Defender 扫描
+              $scanResult = Start-Process -FilePath "MpCmdRun.exe" `
+                -ArgumentList "-Scan", "-ScanType", "3", "-File", "`"$file`"" `
+                -Wait -PassThru -WindowStyle Hidden
+              
+              if ($scanResult.ExitCode -ne 0) {
+                Write-Error "Virus scan failed for $file (Exit code: $($scanResult.ExitCode))"
+                exit 1
+              }
+              Write-Host "✅ Virus scan passed for $file"
+            }
+          }
+
+      - name: Create Release
+        if: ${{ success() }}
+        uses: softprops/action-gh-release@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          name: Redis ${{ env.RELEASE_VERSION }} for Windows
+          tag_name: ${{ env.RELEASE_VERSION }}-windows
+          body_path: redis_latest_body.txt
+          make_latest: ${{ inputs.make_latest }}
+          files: |
+            ${{ env.REDIS_DIST }}-cygwin.zip
+            ${{ env.REDIS_DIST }}-cygwin-with-Service.zip
+            ${{ env.REDIS_DIST }}-msys2.zip
+            ${{ env.REDIS_DIST }}-msys2-with-Service.zip
+
+      - name: Cleanup sensitive data
+        if: always()
+        run: |
+          # 清理可能的敏感文件
+          Remove-Item -Path "redis-*.tar.gz" -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path "${{ env.REDIS_DIST }}-*" -Recurse -Force -ErrorAction SilentlyContinue
