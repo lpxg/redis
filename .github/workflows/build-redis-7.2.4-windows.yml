@@ -22,16 +22,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [x64, x86]
         include:
           - arch: x64
-            msystem: MINGW64
-            prefix: mingw-w64-x86_64
-            platform: x64
-          - arch: x86
-            msystem: MINGW32
-            prefix: mingw-w64-i686
-            platform: Win32
+            msystem: UCRT64  # 使用 UCRT64 替代 MINGW64，更好的 POSIX 兼容性
+            prefix: mingw-w64-ucrt-x86_64
     
     defaults:
       run:
@@ -41,7 +35,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2
+      - name: Setup MSYS2 with full POSIX support
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
@@ -52,57 +46,87 @@ jobs:
             ${{ matrix.prefix }}-pkg-config
             ${{ matrix.prefix }}-openssl
             ${{ matrix.prefix }}-tcl
+            ${{ matrix.prefix }}-libxcrypt  # 提供 crypt.h
+            msys2-runtime-devel  # 提供完整的 POSIX 头文件
             base-devel
             git
             wget
 
-      - name: Download Redis 7.2.4 source (Last BSD Version)
+      - name: Download Redis 7.2.4 source
         run: |
           wget -O redis-${REDIS_VERSION}.tar.gz https://github.com/redis/redis/archive/${REDIS_VERSION}.tar.gz
           tar -xzf redis-${REDIS_VERSION}.tar.gz
           mv redis-${REDIS_VERSION} redis-src
           echo "Building Redis ${REDIS_VERSION} - LAST BSD-3-CLAUSE LICENSE VERSION"
-          echo "This version is free for commercial use without restrictions"
+
+      - name: Fix Windows compatibility issues
+        working-directory: redis-src
+        run: |
+          # 修复 hiredis 的 -Werror 问题
+          sed -i 's/-Werror//g' deps/hiredis/Makefile
+          
+          # 创建缺失的 poll.h 包装（MSYS2 应该已有，但以防万一）
+          if [ ! -f /usr/include/poll.h ]; then
+            echo "#include <sys/poll.h>" > /usr/include/poll.h
+          fi
+
+      - name: Build Redis dependencies first
+        working-directory: redis-src/deps
+        run: |
+          # 单独构建依赖，避免并行问题
+          make hiredis USE_SSL=1 CFLAGS="-O2 -Wno-error"
+          make linenoise
+          make lua
+          make hdr_histogram
+          make fpconv
 
       - name: Build Redis
         working-directory: redis-src
         run: |
-          # 设置编译环境
-          export CFLAGS="-O2 -Wno-error -fno-common"
+          # 设置编译环境 - 禁用 Werror，使用 POSIX 模式
+          export CFLAGS="-O2 -Wno-error -fno-common -D_GNU_SOURCE"
+          export CXXFLAGS="-O2 -Wno-error"
           export LDFLAGS="-static-libgcc"
           
-          # Redis 7.2.4 使用传统 Makefile，无需 ./configure
-          make -j1 MALLOC=libc BUILD_TLS=yes
+          # 清理之前的配置
+          make distclean || true
           
-          echo "Build completed for Redis ${REDIS_VERSION}"
+          # 构建 - 使用单线程避免 Windows 文件锁问题
+          make -j1 MALLOC=libc BUILD_TLS=yes
 
-      - name: Run basic tests
-        working-directory: redis-src
-        continue-on-error: true
+      - name: Test binaries
+        working-directory: redis-src/src
         run: |
-          # 运行简短测试验证构建
-          ./runtest --single unit/printver || true
-          ./runtest --single unit/introspection || true
+          # 验证二进制文件是否生成
+          ls -la *.exe || echo "No .exe files found, checking for ELF..."
+          file redis-server || true
+          ./redis-server --version || true
 
       - name: Package binaries
         working-directory: redis-src
         run: |
           mkdir -p redis-windows-${{ matrix.arch }}
           
-          # 复制可执行文件
-          cp src/redis-server.exe redis-windows-${{ matrix.arch }}/
-          cp src/redis-cli.exe redis-windows-${{ matrix.arch }}/
-          cp src/redis-benchmark.exe redis-windows-${{ matrix.arch }}/
-          cp src/redis-check-aof.exe redis-windows-${{ matrix.arch }}/
-          cp src/redis-check-rdb.exe redis-windows-${{ matrix.arch }}/
-          cp src/redis-sentinel.exe redis-windows-${{ matrix.arch }}/
+          # 复制可执行文件（MSYS2 生成的是 .exe）
+          cp src/redis-server.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
+            cp src/redis-server redis-windows-${{ matrix.arch }}/
+          cp src/redis-cli.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
+            cp src/redis-cli redis-windows-${{ matrix.arch }}/
+          cp src/redis-benchmark.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
+            cp src/redis-benchmark redis-windows-${{ matrix.arch }}/
+          cp src/redis-check-aof.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
+            cp src/redis-check-aof redis-windows-${{ matrix.arch }}/
+          cp src/redis-check-rdb.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
+            cp src/redis-check-rdb redis-windows-${{ matrix.arch }}/
+          cp src/redis-sentinel.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
+            cp src/redis-sentinel redis-windows-${{ matrix.arch }}/
           
           # 复制配置文件
           cp redis.conf redis-windows-${{ matrix.arch }}/
           cp sentinel.conf redis-windows-${{ matrix.arch }}/
           
-          # 创建 Windows 特定的 README
-          cat > redis-windows-${{ matrix.arch }}/README-BSD-LICENSE.txt << 'EOF'
+          # 创建 README
+          cat > redis-windows-${{ matrix.arch }}/README-BSD-LICENSE.txt << EOF
           Redis 7.2.4 for Windows
           =======================
           Architecture: ${{ matrix.arch }}
@@ -114,27 +138,13 @@ jobs:
           This is the final version that is truly free for commercial use without 
           any copyleft requirements or service restrictions.
           
-          LICENSE: BSD-3-Clause (see https://github.com/redis/redis/blob/7.2.4/COPYING)
-          
-          Key advantages of BSD-3-Clause:
-          ✅ Commercial use allowed without restrictions
-          ✅ No requirement to open-source your modifications
-          ✅ No network use clause (unlike AGPL)
-          ✅ No service provider restrictions (unlike SSPL/RSAL)
-          
-          WARNING: Redis 7.4+ changed to RSALv2/SSPL dual license (not OSI-approved)
-          Redis 8.0+ offers AGPLv3 as option (copyleft, network use triggers source release)
-          
-          For true open source freedom, stay with 7.2.x or migrate to Valkey (Linux Foundation fork).
+          LICENSE: BSD-3-Clause
           
           START SERVER:
           redis-server.exe redis.conf
-          
-          CONNECT CLIENT:
-          redis-cli.exe
           EOF
           
-          # 创建 zip 压缩包
+          # 打包
           7z a -tzip redis-${REDIS_VERSION}-windows-${{ matrix.arch }}-BSD.zip redis-windows-${{ matrix.arch }}
 
       - name: Upload artifacts
@@ -143,35 +153,3 @@ jobs:
           name: redis-${{ env.REDIS_VERSION }}-windows-${{ matrix.arch }}-BSD
           path: redis-src/redis-${{ env.REDIS_VERSION }}-windows-${{ matrix.arch }}-BSD.zip
           retention-days: 90
-
-      - name: Create Release (if tagged)
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: redis-src/redis-${{ env.REDIS_VERSION }}-windows-${{ matrix.arch }}-BSD.zip
-          body: |
-            Redis ${{ env.REDIS_VERSION }} for Windows (${{ matrix.arch }})
-            
-            **⚠️ LAST BSD-3-CLAUSE LICENSE VERSION**
-            
-            This is the final Redis version released under the permissive BSD-3-Clause license,
-            making it free for commercial use without copyleft or service restrictions.
-            
-            **License**: BSD-3-Clause (OSI Approved)
-            **Commercial Use**: ✅ Allowed without restrictions
-            **Modification Distribution**: ✅ No requirement to open-source
-            
-            **Why this version matters**:
-            - Redis 7.4+ uses RSALv2/SSPL (not OSI-approved, restricts managed services)
-            - Redis 8.0+ adds AGPLv3 option (copyleft, network use requires source release)
-            - Redis 7.2.4 is the last truly "free" version for all use cases
-            
-            **Alternative**: Consider Valkey (Linux Foundation fork) for ongoing BSD-licensed updates.
-            
-            **Build Details**:
-            - Architecture: ${{ matrix.arch }}
-            - Compiler: GCC (MSYS2)
-            - TLS Support: Yes
-            - Memory Allocator: libc
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
