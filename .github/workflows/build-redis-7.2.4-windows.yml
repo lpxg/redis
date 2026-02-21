@@ -1,102 +1,62 @@
-name: Build Redis 7.2.4 (Last BSD License) on Windows
+name: Build Redis 7.2.4 on Windows (MSYS2 POSIX)
 
 on:
   push:
     branches: [main, master]
-    tags: ['v*']
-  pull_request:
-    branches: [main, master]
   workflow_dispatch:
-    inputs:
-      redis_version:
-        description: 'Redis version (default: 7.2.4 - last BSD version)'
-        required: false
-        default: '7.2.4'
 
 env:
-  REDIS_VERSION: ${{ github.event.inputs.redis_version || '7.2.4' }}
+  REDIS_VERSION: 7.2.4
 
 jobs:
-  build-redis-windows:
+  build:
     runs-on: windows-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x64
-            msystem: UCRT64
-            prefix: mingw-w64-ucrt-x86_64
-    
     defaults:
       run:
         shell: msys2 {0}
-
+    
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup MSYS2
+      - name: Setup MSYS2 (MSYS environment)
         uses: msys2/setup-msys2@v2
         with:
-          msystem: ${{ matrix.msystem }}
+          msystem: MSYS  # 使用 MSYS 而非 UCRT64，提供完整 POSIX
           update: true
           install: >-
-            ${{ matrix.prefix }}-gcc
-            ${{ matrix.prefix }}-make
-            ${{ matrix.prefix }}-pkg-config
-            ${{ matrix.prefix }}-openssl
-            ${{ matrix.prefix }}-tcl
-            ${{ matrix.prefix }}-libwinpthread-git
+            gcc
+            make
+            pkg-config
+            openssl-devel
+            libopenssl
+            tcl
+            python
             base-devel
             git
 
-      - name: Download Redis 7.2.4 source
+      - name: Download Redis
         run: |
-          wget -O redis-${REDIS_VERSION}.tar.gz https://github.com/redis/redis/archive/${REDIS_VERSION}.tar.gz
-          tar -xzf redis-${REDIS_VERSION}.tar.gz
-          mv redis-${REDIS_VERSION} redis-src
+          wget https://github.com/redis/redis/archive/${REDIS_VERSION}.tar.gz
+          tar -xzf ${REDIS_VERSION}.tar.gz
+          cd redis-${REDIS_VERSION}
 
-      - name: Fix Windows compatibility
-        working-directory: redis-src
+      - name: Build
+        working-directory: redis-${{ env.REDIS_VERSION }}
         run: |
-          # 移除 hiredis 的 -Werror
-          sed -i 's/-Werror//g' deps/hiredis/Makefile
+          # 禁用 SSL 避免 Windows API 问题
+          make -j1 MALLOC=libc BUILD_TLS=no
 
-      - name: Build Redis
-        working-directory: redis-src
+      - name: Package
+        working-directory: redis-${{ env.REDIS_VERSION }}
         run: |
-          export CFLAGS="-O2 -Wno-error -D_GNU_SOURCE"
-          export LDFLAGS="-static-libgcc"
-          
-          make distclean 2>/dev/null || true
-          make -j1 MALLOC=libc BUILD_TLS=yes
+          mkdir -p redis-win
+          cp src/redis-server redis-win/
+          cp src/redis-cli redis-win/
+          cp src/redis-benchmark redis-win/
+          cp redis.conf sentinel.conf redis-win/
+          tar -czf redis-${{ env.REDIS_VERSION }}-msys2.tar.gz redis-win
 
-      - name: Package binaries
-        working-directory: redis-src
-        run: |
-          mkdir -p redis-windows-${{ matrix.arch }}
-          
-          # 复制可执行文件
-          for bin in redis-server redis-cli redis-benchmark redis-check-aof redis-check-rdb redis-sentinel; do
-            if [ -f src/${bin}.exe ]; then
-              cp src/${bin}.exe redis-windows-${{ matrix.arch }}/
-            elif [ -f src/${bin} ]; then
-              cp src/${bin} redis-windows-${{ matrix.arch }}/
-            fi
-          done
-          
-          cp redis.conf sentinel.conf redis-windows-${{ matrix.arch }}/
-          
-          cat > redis-windows-${{ matrix.arch }}/README.txt << 'EOF'
-          Redis 7.2.4 for Windows (Last BSD License Version)
-          Build Date: $(date)
-          License: BSD-3-Clause (Free for commercial use)
-          EOF
-          
-          7z a -tzip redis-${REDIS_VERSION}-windows-${{ matrix.arch }}-BSD.zip redis-windows-${{ matrix.arch }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
-          name: redis-${{ env.REDIS_VERSION }}-windows-${{ matrix.arch }}-BSD
-          path: redis-src/redis-${{ env.REDIS_VERSION }}-windows-${{ matrix.arch }}-BSD.zip
+          name: redis-msys2
+          path: redis-${{ env.REDIS_VERSION }}/redis-${{ env.REDIS_VERSION }}-msys2.tar.gz
