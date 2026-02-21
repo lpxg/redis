@@ -24,7 +24,7 @@ jobs:
       matrix:
         include:
           - arch: x64
-            msystem: UCRT64  # 使用 UCRT64 替代 MINGW64，更好的 POSIX 兼容性
+            msystem: UCRT64
             prefix: mingw-w64-ucrt-x86_64
     
     defaults:
@@ -35,7 +35,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Setup MSYS2 with full POSIX support
+      - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
         with:
           msystem: ${{ matrix.msystem }}
@@ -46,105 +46,53 @@ jobs:
             ${{ matrix.prefix }}-pkg-config
             ${{ matrix.prefix }}-openssl
             ${{ matrix.prefix }}-tcl
-            ${{ matrix.prefix }}-libxcrypt  # 提供 crypt.h
-            msys2-runtime-devel  # 提供完整的 POSIX 头文件
+            ${{ matrix.prefix }}-libwinpthread-git
             base-devel
             git
-            wget
 
       - name: Download Redis 7.2.4 source
         run: |
           wget -O redis-${REDIS_VERSION}.tar.gz https://github.com/redis/redis/archive/${REDIS_VERSION}.tar.gz
           tar -xzf redis-${REDIS_VERSION}.tar.gz
           mv redis-${REDIS_VERSION} redis-src
-          echo "Building Redis ${REDIS_VERSION} - LAST BSD-3-CLAUSE LICENSE VERSION"
 
-      - name: Fix Windows compatibility issues
+      - name: Fix Windows compatibility
         working-directory: redis-src
         run: |
-          # 修复 hiredis 的 -Werror 问题
+          # 移除 hiredis 的 -Werror
           sed -i 's/-Werror//g' deps/hiredis/Makefile
-          
-          # 创建缺失的 poll.h 包装（MSYS2 应该已有，但以防万一）
-          if [ ! -f /usr/include/poll.h ]; then
-            echo "#include <sys/poll.h>" > /usr/include/poll.h
-          fi
-
-      - name: Build Redis dependencies first
-        working-directory: redis-src/deps
-        run: |
-          # 单独构建依赖，避免并行问题
-          make hiredis USE_SSL=1 CFLAGS="-O2 -Wno-error"
-          make linenoise
-          make lua
-          make hdr_histogram
-          make fpconv
 
       - name: Build Redis
         working-directory: redis-src
         run: |
-          # 设置编译环境 - 禁用 Werror，使用 POSIX 模式
-          export CFLAGS="-O2 -Wno-error -fno-common -D_GNU_SOURCE"
-          export CXXFLAGS="-O2 -Wno-error"
+          export CFLAGS="-O2 -Wno-error -D_GNU_SOURCE"
           export LDFLAGS="-static-libgcc"
           
-          # 清理之前的配置
-          make distclean || true
-          
-          # 构建 - 使用单线程避免 Windows 文件锁问题
+          make distclean 2>/dev/null || true
           make -j1 MALLOC=libc BUILD_TLS=yes
-
-      - name: Test binaries
-        working-directory: redis-src/src
-        run: |
-          # 验证二进制文件是否生成
-          ls -la *.exe || echo "No .exe files found, checking for ELF..."
-          file redis-server || true
-          ./redis-server --version || true
 
       - name: Package binaries
         working-directory: redis-src
         run: |
           mkdir -p redis-windows-${{ matrix.arch }}
           
-          # 复制可执行文件（MSYS2 生成的是 .exe）
-          cp src/redis-server.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
-            cp src/redis-server redis-windows-${{ matrix.arch }}/
-          cp src/redis-cli.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
-            cp src/redis-cli redis-windows-${{ matrix.arch }}/
-          cp src/redis-benchmark.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
-            cp src/redis-benchmark redis-windows-${{ matrix.arch }}/
-          cp src/redis-check-aof.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
-            cp src/redis-check-aof redis-windows-${{ matrix.arch }}/
-          cp src/redis-check-rdb.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
-            cp src/redis-check-rdb redis-windows-${{ matrix.arch }}/
-          cp src/redis-sentinel.exe redis-windows-${{ matrix.arch }}/ 2>/dev/null || \
-            cp src/redis-sentinel redis-windows-${{ matrix.arch }}/
+          # 复制可执行文件
+          for bin in redis-server redis-cli redis-benchmark redis-check-aof redis-check-rdb redis-sentinel; do
+            if [ -f src/${bin}.exe ]; then
+              cp src/${bin}.exe redis-windows-${{ matrix.arch }}/
+            elif [ -f src/${bin} ]; then
+              cp src/${bin} redis-windows-${{ matrix.arch }}/
+            fi
+          done
           
-          # 复制配置文件
-          cp redis.conf redis-windows-${{ matrix.arch }}/
-          cp sentinel.conf redis-windows-${{ matrix.arch }}/
+          cp redis.conf sentinel.conf redis-windows-${{ matrix.arch }}/
           
-          # 创建 README
-          cat > redis-windows-${{ matrix.arch }}/README-BSD-LICENSE.txt << EOF
-          Redis 7.2.4 for Windows
-          =======================
-          Architecture: ${{ matrix.arch }}
+          cat > redis-windows-${{ matrix.arch }}/README.txt << 'EOF'
+          Redis 7.2.4 for Windows (Last BSD License Version)
           Build Date: $(date)
-          
-          ⚠️  IMPORTANT LICENSING INFORMATION:
-          
-          Redis 7.2.4 is the LAST version released under the BSD-3-Clause license.
-          This is the final version that is truly free for commercial use without 
-          any copyleft requirements or service restrictions.
-          
-          LICENSE: BSD-3-Clause
-          
-          START SERVER:
-          redis-server.exe redis.conf
+          License: BSD-3-Clause (Free for commercial use)
           EOF
           
-          # 打包
           7z a -tzip redis-${REDIS_VERSION}-windows-${{ matrix.arch }}-BSD.zip redis-windows-${{ matrix.arch }}
 
       - name: Upload artifacts
@@ -152,4 +100,3 @@ jobs:
         with:
           name: redis-${{ env.REDIS_VERSION }}-windows-${{ matrix.arch }}-BSD
           path: redis-src/redis-${{ env.REDIS_VERSION }}-windows-${{ matrix.arch }}-BSD.zip
-          retention-days: 90
